@@ -1,26 +1,45 @@
 {
-  description = "CSC5101 lab env";
+  description = "CSC5101 dev shell";
 
   inputs = {
-    nixpkgs.url = "github:nixos/nixpkgs/nixos-unstable";
+    nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
   };
 
-  outputs = { self, nixpkgs, ... }: let
-    system = "aarch64-darwin";
-  in {
-    devShells."${system}".default = let
-      pkgs = import nixpkgs { inherit system; };
-    in pkgs.mkShell {
-
-      packages = with pkgs; [
-        # build
-        gcc
+  outputs =
+    { nixpkgs, ... }:
+    let
+      systems = [
+        "x86_64-linux"
+        "aarch64-darwin"
       ];
+      forAllSystems = nixpkgs.lib.genAttrs systems;
+    in
+    {
+      devShells = forAllSystems (
+        system:
+        let
+          pkgs = nixpkgs.legacyPackages.${system};
+          inherit (pkgs.lib) optionals optionalString;
+          inherit (pkgs.stdenv.hostPlatform) isLinux isDarwin;
+        in
+        {
+          default = pkgs.mkShell {
+            packages =
+              with pkgs;
+              [
+                gcc
+              ]
+              ++ optionals isLinux [
+                # na
+              ]
+              ++ optionals isDarwin [
+                # na
+              ];
 
-      shellHook = ''
-      '';
-
+            shellHook = ''
+            '';
+          };
+        }
+      );
     };
-  };
 }
-
