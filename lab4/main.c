@@ -1,179 +1,227 @@
+#include <limits.h>
 #include <pthread.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
-#include <string.h>
+#include <err.h>
+#include <stdatomic.h>
+#include <unistd.h>
 
-#include "mem.h"
+#define N_CELLS     128
+#define N_THREADS   20
+#define N_LOOPS     (1024 * 1024)
 
-atomic_cell_t **atomic_memory;
-cell_t **nonatomic_memory;
-void **memory;
+typedef enum version_e {
+  STM, STM_BACK, LOCK, ATOMIC
+} version_t;
 
-_Thread_local uint64_t mark = 0;
-_Thread_local TX tx;
+typedef struct cell_s {
+  _Atomic int value;
+  _Atomic int counter;
+} cell_t;
+
+typedef struct memory_s {
+  pthread_mutex_t lock;
+  _Atomic(cell_t*) cells[N_CELLS];
+  _Atomic uint64_t clock;
+} memory_t;
+
+typedef struct tx_s {
+  bool pending_reads[N_CELLS];
+  int pending_writes[N_CELLS];
+  uint64_t mark;
+  uint64_t backoff;
+} tx_t;
+
+version_t version;
+memory_t memory;
+_Thread_local tx_t tx;
+
+cell_t *new_cell(int value, int counter) {
+  cell_t *res = malloc(sizeof(*res));
+  res->value = value;
+  res->counter = counter;
+  return res;
+}
+
+void init_memory() {
+  pthread_mutex_init(&memory.lock, NULL);
+  for (size_t i = 0; i < N_CELLS; i++) {
+    memory.cells[i] = new_cell(0, 0);
+  }
+  memory.clock = 1;
+}
+
+void backoff() {
+  int t = 1 + rand() % tx.backoff;
+  usleep(t);
+  if (tx.backoff < 512)
+    tx.backoff *= 2;
+}
 
 void startTX() {
-  for (size_t i = 0; i < MEM_SIZE; i++) {
-    tx.reads[i] = 0;
-    tx.writes[i] = 0;
-    tx.counters[i] = 0;
+  for (size_t i = 0; i < N_CELLS; i++) {
+    tx.pending_reads[i] = false;
+    tx.pending_writes[i] = INT_MAX;
   }
 
-  struct timespec t0;
-  clock_gettime(CLOCK_MONOTONIC, &t0);
-
-  mark = t0.tv_sec * 1000 + (t0.tv_nsec / 1000000);
+  tx.mark = atomic_load_explicit(&memory.clock, memory_order_acquire);
 }
 
-uintptr_t read(int n) {
-  cell_t *cursor = nonatomic_memory[n];
-  if (cursor->counter >= mark) {
-    return NULL;
-  }
+int readTX(int n) {
+  if (tx.pending_writes[n] != INT_MAX)
+    return tx.pending_writes[n];
 
-  tx.reads
+  cell_t* cur = atomic_load_explicit(&memory.cells[n], memory_order_acquire);
+  if (cur->counter >= tx.mark)
+    // ABORT
+    return INT_MAX;
 
-      return (uintptr_t)cursor;
+  tx.pending_reads[n] = true;
+  return cur->value;
 }
 
-void write(int n, uintptr_t value) {}
+void writeTX(int n, int value) {
+  tx.pending_writes[n] = value;
+}
 
-bool commitTX() {}
+bool commitTX() {
+  pthread_mutex_lock(&memory.lock);
 
-void *pthread_main(void *arg) {
-  thread_args_t *args = (thread_args_t *)arg;
-
-  size_t id = args->id;
-  printf("Hello I am thread %lu\n", id);
-
-  struct timespec t0;
-  struct timespec t1;
-
-  clock_gettime(CLOCK_MONOTONIC, &t0);
-
-  switch (args->algo) {
-  case ATOMIC: {
-  }
-    for (size_t i = 0; i < 1024 * 1024; i++) {
-      atomic_memory[0]->value++;
-      atomic_memory[0]->counter++;
+  for (size_t i = 0; i < N_CELLS; i++) {
+    if (tx.pending_reads[i]
+        && memory.cells[i]->counter >= tx.mark) {
+      // ABORT
+      pthread_mutex_unlock(&memory.lock);
+      return false;
     }
-    break;
-  case MUTEX: {
-  }
-    for (size_t i = 0; i < 1024 * 1024; i++) {
-      pthread_mutex_lock(args->lock);
-      nonatomic_memory[0]->value++;
-      nonatomic_memory[0]->counter++;
-      pthread_mutex_unlock(args->lock);
-    }
-    break;
-  case TM:
-    for (size_t i = 0; i < 1024 * 1024; i++) {
-    restart:
-      startTX();
-      int value = read(0); // read x
-      if (value == INT64_MAX)
-        goto restart;
-      write(0, value + 1); // write x + 1
-      if (!commitTX())     // try to commit
-        goto restart;      // in case of abort, restart
-    }
-    break;
-  case NA:
-    break;
   }
 
-  clock_gettime(CLOCK_MONOTONIC, &t1);
+  for (size_t i = 0; i < N_CELLS; i++) {
+    if (tx.pending_writes[i] != INT_MAX) {
+      cell_t *new = new_cell(tx.pending_writes[i], memory.clock);
+      atomic_store_explicit(&memory.cells[i], new, memory_order_release);
+    }
+  }
 
-  args->dur_ms = (int64_t)(t1.tv_sec - t0.tv_sec) * 1000 +
-                 (t1.tv_nsec - t0.tv_nsec) / 1000000;
+  atomic_store_explicit(&memory.clock, memory.clock + 1, memory_order_release);
+  pthread_mutex_unlock(&memory.lock);
+
+  tx.backoff = 1;
+  return true;
+}
+
+void *thread_main(void *arg) {
+  size_t tid = *(size_t *)arg;
+
+  tx.backoff = 1;
+  int n;
+
+  switch (version) {
+    case STM:
+      printf("[th #%2lu]: running STM\n", tid);
+      for (size_t i = 0; i < N_LOOPS; i++) {
+        n = rand() % N_CELLS;
+      restart:
+        startTX();
+        int value = readTX(n);
+        if(value == INT_MAX) {
+          goto restart;
+        }
+        writeTX(n, value + 1);
+        if (!commitTX()) {
+          goto restart;
+        }
+      }
+      break;
+    case STM_BACK:
+      printf("[th #%2lu]: running STM_BACK\n", tid);
+      for (size_t i = 0; i < N_LOOPS; i++) {
+        n = rand() % N_CELLS;
+      restart_back:
+        startTX();
+        int value = readTX(n);
+        if(value == INT_MAX) {
+          backoff();
+          goto restart_back;
+        }
+        writeTX(n, value + 1);
+        if (!commitTX()) {
+          backoff();
+          goto restart_back;
+        }
+      }
+      break;
+    case LOCK:
+      printf("[th #%2lu]: running LOCK\n", tid);
+      for (size_t i = 0; i < N_LOOPS; i++) {
+        n = rand() % N_CELLS;
+        pthread_mutex_lock(&memory.lock);
+        memory.cells[n]->value++;
+        pthread_mutex_unlock(&memory.lock);
+      }
+      break;
+    case ATOMIC:
+      printf("[th #%2lu]: running ATOMIC\n", tid);
+      for (size_t i = 0; i < N_LOOPS; i++) {
+        n = rand() % N_CELLS;
+        atomic_fetch_add(&memory.cells[n]->value, 1);
+      }
+      break;
+  }
 
   return EXIT_SUCCESS;
 }
 
 int main(int argc, char **argv) {
-  if (argc != 3) {
-    fprintf(stderr, "[ERROR] needs (2) args: N, algo\n");
-    return EXIT_FAILURE;
-  }
-  size_t N = atoi(argv[1]);
+  if (argc != 2)
+    errx(EXIT_FAILURE, "required: version [0: STM, 1: STM_BACK, 2: LOCK, 3: ATOMIC]");
 
-  algo_t algo = NA;
-  if (strcmp(argv[2], "atomic") == 0) {
-    algo = ATOMIC;
-  }
-  if (strcmp(argv[2], "mutex") == 0) {
-    algo = MUTEX;
-  }
-  if (strcmp(argv[2], "tm") == 0) {
-    algo = TM;
-  }
-  if (algo == NA) {
-    fprintf(stderr, "[ERROR] unsuported algo: %s\n", argv[2]);
-    return EXIT_FAILURE;
-  }
+  size_t v = atoi(argv[1]);
+  if (v > 3)
+    errx(EXIT_FAILURE, "unsupported version: %lu", v);
 
-  atomic_memory = calloc(MEM_SIZE, sizeof(*atomic_memory));
-  for (size_t i = 0; i < MEM_SIZE; i++) {
-    atomic_memory[i] = calloc(1, sizeof(*atomic_memory[i]));
-    atomic_memory[i]->value = i;
+  version = v;
+
+  init_memory();
+
+  pthread_t threads[N_THREADS];
+  size_t tid[N_THREADS];
+
+  struct timespec t0, t1;
+  clock_gettime(CLOCK_MONOTONIC, &t0);
+
+  for (size_t i = 0; i < N_THREADS; i++) {
+    tid[i] = i;
+    pthread_create(&threads[i], NULL, thread_main, &tid[i]);
   }
 
-  nonatomic_memory = calloc(MEM_SIZE, sizeof(*nonatomic_memory));
-  for (size_t i = 0; i < MEM_SIZE; i++) {
-    nonatomic_memory[i] = calloc(1, sizeof(*nonatomic_memory[i]));
-    nonatomic_memory[i]->value = i;
-  }
-
-  switch (algo) {
-  case ATOMIC:
-    memory = (void **)atomic_memory;
-    break;
-  case MUTEX:
-    memory = (void **)nonatomic_memory;
-    break;
-  case NA:
-    break;
-  }
-
-  pthread_t threads[N];
-  thread_args_t *args = calloc(N, sizeof(*args));
-
-  pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
-
-  printf("Starting up w/ %lu threads!\n", N);
-  for (size_t i = 0; i < N; i++) {
-    args[i].id = i;
-    args[i].algo = algo;
-    args[i].lock = &lock;
-    args[i].memory = memory;
-    pthread_create(&threads[i], NULL, pthread_main, &args[i]);
-  }
-
-  uint64_t t_avg_ms = 0;
-
-  for (size_t i = 0; i < N; i++) {
+  for (size_t i = 0; i < N_THREADS; i++) {
     pthread_join(threads[i], NULL);
-    t_avg_ms += args[i].dur_ms / N;
   }
 
-  printf("EXPECTED = %lu\n", 1024 * 1024 * N);
+  clock_gettime(CLOCK_MONOTONIC, &t1);
 
-  switch (algo) {
-  case ATOMIC:
-    printf("MEM[0] = %lld\n", ((atomic_cell_t **)memory)[0]->value);
-    break;
-  case MUTEX:
-    printf("MEM[0] = %lld\n", ((cell_t **)memory)[0]->value);
-    break;
-  case NA:
-    break;
+  uint64_t elapsed_ms = (
+    (t1.tv_sec - t0.tv_sec) * 1e3
+    + (t1.tv_nsec - t0.tv_nsec) * 1e-6
+  );
+
+  printf("total time elapsed: %llu ms\n", elapsed_ms);
+
+  int expected = N_LOOPS * N_THREADS;
+  int actual = 0;
+  for (size_t i = 0; i < N_CELLS; i++) {
+    actual += memory.cells[i]->value;
   }
 
-  printf("AVG TIME = %lld ms\n", t_avg_ms);
+  printf("expected: %d, actual: %d\n", expected, actual);
+  if (expected == actual) {
+    printf("transaction validated!\n");
+  } else {
+    printf("transaction failed :<\n");
+  }
 
   return EXIT_SUCCESS;
 }

@@ -6,8 +6,17 @@ all: tm
 tm: main.c
 	$(CC) $(CFLAGS) -o $@ main.c
 
-run: tm
-	./tm 4
+STM: tm
+	./tm 0
+
+STM_BACK: tm
+	./tm 1
+
+LOCK: tm
+	./tm 2
+
+ATOMIC: tm
+	./tm 3
 
 clean:
 	rm -f tm
