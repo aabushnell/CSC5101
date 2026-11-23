@@ -73,7 +73,7 @@ int readTX(int n) {
   if (tx.pending_writes[n] != INT_MAX)
     return tx.pending_writes[n];
 
-  cell_t* cur = atomic_load_explicit(&memory.cells[n], memory_order_acquire);
+  cell_t* cur = atomic_load_explicit(&memory.cells[n], memory_order_relaxed);
   if (cur->counter >= tx.mark)
     // ABORT
     return INT_MAX;
@@ -101,7 +101,7 @@ bool commitTX() {
   for (size_t i = 0; i < N_CELLS; i++) {
     if (tx.pending_writes[i] != INT_MAX) {
       cell_t *new = new_cell(tx.pending_writes[i], memory.clock);
-      atomic_store_explicit(&memory.cells[i], new, memory_order_release);
+      atomic_store_explicit(&memory.cells[i], new, memory_order_relaxed);
     }
   }
 
