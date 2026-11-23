@@ -72,6 +72,8 @@ void *cleanup(void *arg) {
       exit(EXIT_FAILURE);
     }
 
+    
+
     nvmm->tail++;
   }
 }
@@ -91,9 +93,11 @@ int main(void) {
   fd_m = open("nvmm.dat", O_RDWR | O_CREAT, S_IRWXU);
   if (fd_m == -1)
     err(EXIT_FAILURE, "open nvmm");
+
   ret = ftruncate(fd_m, NVMM_SIZE);
   if (ret == -1)
     err(EXIT_FAILURE, "ftruncate nvmm");
+
   addr = mmap(NULL, NVMM_SIZE, PROT_READ | PROT_WRITE, MAP_SHARED, fd_m, 0);
   if (addr == MAP_FAILED)
     err(EXIT_FAILURE, "mmap nvmm");
@@ -101,7 +105,6 @@ int main(void) {
   nvmm = (struct nvmm *)addr;
 
   pthread_t tid;
-  pthread_create(&tid, NULL, cleanup, NULL);
 
   // -- pwrite --
 
