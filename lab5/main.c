@@ -38,19 +38,19 @@ int my_pwrite(int fd, const void *buf, size_t n, off_t off) {
 
   // buf
   memcpy(cur_op->buf, buf, n);
-  pwb(cur_op->second_cache_line);
+  pwb(&cur_op->second_cache_line);
 
   // meta
   cur_op->fd = fd;
   cur_op->n = n;
   cur_op->off = off;
-  pwb(cur_op->first_cache_line);
+  pwb(&cur_op->first_cache_line);
 
   pfence();
 
   // commit
   cur_op->committed = true;
-  pwb(cur_op->first_cache_line);
+  pwb(&cur_op->first_cache_line);
 
   psync();
 
